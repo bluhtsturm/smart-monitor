@@ -1,0 +1,36 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: shellcheck -s bash smart-monitor.de.sh smart-monitor.en.sh
+
+      - name: Syntax check
+        run: |
+          bash -n smart-monitor.de.sh
+          bash -n smart-monitor.en.sh
+
+      - name: Verify both versions stay logically identical
+        run: |
+          # Masks comments and string literals, then compares the remaining
+          # code structure. The usage() help text is prose and differs by
+          # design, so it is cut out first.
+          norm() {
+            sed -e '/^usage() {/,/^}/d' \
+                -e 's/#.*$//' -e "s/'[^']*'/S/g" -e 's/"[^"]*"/S/g' \
+                -e 's/[[:space:]]\+/ /g' "$1" | grep -v '^ *$'
+          }
+          diff <(norm smart-monitor.de.sh) <(norm smart-monitor.en.sh)
