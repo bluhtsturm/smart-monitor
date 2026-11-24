@@ -26,9 +26,10 @@ Die Logik ist in beiden Dateien Zeile für Zeile dieselbe, nur die Texte und Kom
 ### Funktionen
 
 - **Automatische Geräteerkennung** über `lsblk`, mit Transport (SATA, NVMe, USB, SAS, virtio)
-- **Automatische Ermittlung der smartctl-Parameter** — probiert der Reihe nach `-d sat`, `-d nvme`, `-d scsi`, `-d sat,12`, `-d ata`, bis das Gerät antwortet
+- **Automatische Ermittlung der smartctl-Parameter** — probiert der Reihe nach `-d sat`, `-d sat,12`, `-d nvme`, `-d scsi`, `-d ata`, bis das Gerät antwortet
+- **Auswertung nach dem, was tatsächlich antwortet** — ob ATA, NVMe oder SCSI, entscheidet die Antwort von `smartctl -i`, nicht der Gerätename. NVMe-SSDs in USB-Gehäusen und Pfade wie `/dev/disk/by-id/…` werden dadurch richtig ausgewertet
 - **NVMe-korrekt**: Tests und Logs laufen gegen den Controller-Knoten (`/dev/nvme0`), nicht gegen den Namespace (`/dev/nvme0n1`)
-- **Fortschrittsbalken mit Restzeitschätzung** — aus dem gemessenen Fortschritt, ersatzweise aus der Herstellerangabe (`recommended polling time`)
+- **Fortschrittsbalken mit Restzeitschätzung** — gemessen zwischen den Fortschrittsstufen der Firmware, bis zur ersten Stufe aus der Herstellerangabe (`recommended polling time`)
 - **Hängt sich an bereits laufende Tests an**, statt sie zu stören oder zu scheitern
 - **Klartext-Bewertung** statt Rohwerten, mit passendem Exitcode für die Weiterverarbeitung
 - **Nicht-interaktiver Modus** über `-d` und `-a` — geeignet für Cron und systemd
@@ -118,10 +119,12 @@ Selbsttests sind **lesend und ungefährlich**. Der Datenträger bleibt währendd
 
 | Zustand | Auslöser | Code |
 |---|---|---|
-| Kritisch | `smartctl -H` meldet FAILED oder ein Attribut steht auf `FAILING_NOW` | 2 |
+| Kritisch | `smartctl -H` meldet FAILED oder ein Pre-fail-Attribut steht auf `FAILING_NOW` | 2 |
 | Auffällig | `Reallocated_Sector_Ct`, `Reallocated_Event_Count`, `Current_Pending_Sector` oder `Offline_Uncorrectable` größer als 0 | 1 |
+| Auffällig | Der jüngste Selbsttest ist mit einem Fehler beendet worden | 1 |
+| Auffällig | Ein Old_age-Attribut steht auf `FAILING_NOW` (z. B. Temperatur gerade über der Schwelle) | 1 |
 | Stark genutzt | Normalisierter Wert von `Wear_Leveling_Count`, `Percent_Lifetime_Remain`, `Media_Wearout_Indicator` oder `SSD_Life_Left` unter 20 | 1 |
-| Unbekannt | Weder Health-Status noch Attribute lesbar | 1 |
+| Unbekannt | Weder Health-Status noch Attributtabelle lesbar | 1 |
 | Unauffällig | keiner der obigen Fälle | 0 |
 
 **NVMe**
@@ -130,12 +133,13 @@ Selbsttests sind **lesend und ungefährlich**. Der Datenträger bleibt währendd
 |---|---|---|
 | Kritisch | `smartctl -H` meldet FAILED, **oder** `Available Spare` liegt auf/unter `Available Spare Threshold` | 2 |
 | Auffällig | `Critical Warning` ungleich 0 | 1 |
+| Auffällig | Der jüngste Selbsttest ist mit einem Fehler beendet worden | 1 |
 | Abgenutzt | `Percentage Used` ab 90 % | 1 |
 | Auffällig | `Media and Data Integrity Errors` größer als 0 | 1 |
 | Unbekannt | keine Werte lesbar | 1 |
 | Unauffällig | keiner der obigen Fälle | 0 |
 
-Zusätzlich wird der jüngste Eintrag im Selbsttest-Log geprüft. Steht dort ein Fehler statt „Completed without error", steigt der Exitcode mindestens auf 1.
+Der jüngste Eintrag im Selbsttest-Log fließt in die Bewertung ein: Endet er mit einem Fehler (z. B. „Completed: read failure"), lautet der Zustand mindestens „Auffällig" und der Exitcode mindestens 1. Ein abgebrochener oder unterbrochener Test zählt nicht als Fehler. In der Werteliste steht das Ergebnis als „Letzter Selbsttest".
 
 Wichtig: die Restlebensdauer steht im **normalisierten** Wert (Spalte `VALUE`), nicht im Rohwert. `Wear_Leveling_Count` mit Rohwert 201 und VALUE 94 heißt: 94 % Restlebensdauer, nicht 201 von irgendwas. Das ist eine der häufigsten Fehlinterpretationen von SMART-Daten.
 
@@ -185,9 +189,9 @@ Für dauerhafte Überwachung im Hintergrund ist der Daemon `smartd` aus demselbe
 
 - **USB-Gehäuse** reichen SMART-Kommandos oft nur teilweise durch. Das Skript warnt, versucht es aber trotzdem. Wenn nichts geht, hilft manchmal ein manuelles `smartctl -d sat -a /dev/sdX` oder `-d usbjmicron`.
 - **Hardware-RAID-Controller** verstecken die einzelnen Platten. Dafür braucht es gerätespezifische Parameter wie `-d megaraid,N` oder `-d cciss,N`, die das Skript nicht automatisch durchprobiert.
-- **SAS/SCSI-Platten** liefern keine ATA-Attributtabelle. Health-Status und Selbsttests funktionieren, die Detailwerte bleiben leer.
+- **SAS/SCSI-Platten** liefern keine ATA-Attributtabelle. Health-Status, Selbsttests samt Fortschritt und der Abbruch funktionieren, die Detailwerte bleiben leer.
 - **Virtuelle Datenträger** (virtio, mmc) haben in der Regel gar keine SMART-Daten.
-- Die Restzeitschätzung ist eine Schätzung. Firmware-Angaben zur Testdauer sind oft großzügig gerundet.
+- Die Restzeitschätzung ist eine Schätzung. ATA-Laufwerke melden den Fortschritt nur in 10-%-Stufen; eine gemessene Restzeit gibt es deshalb erst nach der ersten Stufe, vorher gilt die Herstellerangabe. Die ist oft großzügig gerundet.
 
 ### Fehlerbehebung
 
@@ -209,7 +213,8 @@ bash -n smart-monitor.de.sh
 Beide Dateien sind bewusst logisch identisch. Wer eine ändert, sollte die andere mitziehen; ein Strukturvergleich, der Kommentare und Zeichenketten ausblendet, macht Abweichungen sichtbar:
 
 ```bash
-norm() { sed -e 's/#.*$//' -e "s/'[^']*'/S/g" -e 's/"[^"]*"/S/g' \
+norm() { sed -e '/^usage() {/,/^}/d' \
+             -e 's/#.*$//' -e "s/'[^']*'/S/g" -e 's/"[^"]*"/S/g' \
              -e 's/[[:space:]]\+/ /g' "$1" | grep -v '^ *$'; }
 diff <(norm smart-monitor.de.sh) <(norm smart-monitor.en.sh)
 ```
@@ -238,9 +243,10 @@ The logic is line-for-line the same in both files; only the messages and comment
 ### Features
 
 - **Automatic device discovery** via `lsblk`, including transport (SATA, NVMe, USB, SAS, virtio)
-- **Automatic smartctl parameter detection** — tries `-d sat`, `-d nvme`, `-d scsi`, `-d sat,12`, `-d ata` in turn until the device answers
+- **Automatic smartctl parameter detection** — tries `-d sat`, `-d sat,12`, `-d nvme`, `-d scsi`, `-d ata` in turn until the device answers
+- **Evaluated by what actually answers** — whether ATA, NVMe or SCSI is decided by the `smartctl -i` response, not the device name. NVMe SSDs in USB enclosures and paths such as `/dev/disk/by-id/…` are therefore evaluated correctly
 - **NVMe done right**: tests and logs target the controller node (`/dev/nvme0`), not the namespace (`/dev/nvme0n1`)
-- **Progress bar with a remaining-time estimate**, taken from measured progress and falling back to the vendor's `recommended polling time`
+- **Progress bar with a remaining-time estimate**, measured between the firmware's progress steps and taken from the vendor's `recommended polling time` until the first step
 - **Attaches to an already running test** instead of disturbing it or failing
 - **Plain-language verdict** instead of raw values, with a matching exit code for further processing
 - **Non-interactive mode** via `-d` and `-a` — suitable for cron and systemd
@@ -330,10 +336,12 @@ Self-tests are **read-only and harmless**. The drive stays usable while one runs
 
 | Verdict | Trigger | Code |
 |---|---|---|
-| Critical | `smartctl -H` reports FAILED, or an attribute is `FAILING_NOW` | 2 |
+| Critical | `smartctl -H` reports FAILED, or a pre-fail attribute is `FAILING_NOW` | 2 |
 | Suspicious | `Reallocated_Sector_Ct`, `Reallocated_Event_Count`, `Current_Pending_Sector` or `Offline_Uncorrectable` greater than 0 | 1 |
+| Suspicious | The most recent self-test ended with an error | 1 |
+| Suspicious | An old-age attribute is `FAILING_NOW` (e.g. temperature currently above its limit) | 1 |
 | Heavily used | Normalised value of `Wear_Leveling_Count`, `Percent_Lifetime_Remain`, `Media_Wearout_Indicator` or `SSD_Life_Left` below 20 | 1 |
-| Unknown | Neither health status nor attributes readable | 1 |
+| Unknown | Neither health status nor attribute table readable | 1 |
 | Healthy | None of the above | 0 |
 
 **NVMe**
@@ -342,12 +350,13 @@ Self-tests are **read-only and harmless**. The drive stays usable while one runs
 |---|---|---|
 | Critical | `smartctl -H` reports FAILED, **or** `Available Spare` is at/below `Available Spare Threshold` | 2 |
 | Suspicious | `Critical Warning` other than 0 | 1 |
+| Suspicious | The most recent self-test ended with an error | 1 |
 | Worn | `Percentage Used` at 90 % or higher | 1 |
 | Suspicious | `Media and Data Integrity Errors` greater than 0 | 1 |
 | Unknown | No values readable | 1 |
 | Healthy | None of the above | 0 |
 
-On top of that, the most recent self-test log entry is checked. If it records a failure rather than "Completed without error", the exit code rises to at least 1.
+The most recent self-test log entry is part of the verdict: if it ended with an error (e.g. "Completed: read failure"), the condition is at least "Suspicious" and the exit code at least 1. An aborted or interrupted test does not count as an error. The key values list shows the result as "Latest self-test".
 
 One thing worth knowing: remaining life lives in the **normalised** value (the `VALUE` column), not in the raw value. `Wear_Leveling_Count` with raw value 201 and VALUE 94 means 94 % life left, not 201 of anything. This is one of the most common misreadings of SMART data.
 
@@ -397,9 +406,9 @@ For continuous background monitoring, the `smartd` daemon from the same package 
 
 - **USB enclosures** frequently pass SMART commands through only partially. The script warns but still tries. When nothing works, a manual `smartctl -d sat -a /dev/sdX` or `-d usbjmicron` sometimes helps.
 - **Hardware RAID controllers** hide the individual disks. They need device-specific parameters such as `-d megaraid,N` or `-d cciss,N`, which the script does not try automatically.
-- **SAS/SCSI drives** do not expose an ATA attribute table. Health status and self-tests work; the detailed values stay empty.
+- **SAS/SCSI drives** do not expose an ATA attribute table. Health status, self-tests including progress, and aborting work; the detailed values stay empty.
 - **Virtual drives** (virtio, mmc) usually have no SMART data at all.
-- The remaining-time figure is an estimate. Firmware-reported test durations are often generously rounded.
+- The remaining-time figure is an estimate. ATA drives report progress in 10 % steps only, so a measured figure is available after the first step; until then the vendor figure applies, and that is often generously rounded.
 
 ### Troubleshooting
 
@@ -421,7 +430,8 @@ bash -n smart-monitor.de.sh
 The two files are deliberately identical in logic. Change one and you should change the other; a structural comparison that masks comments and string literals makes any drift visible:
 
 ```bash
-norm() { sed -e 's/#.*$//' -e "s/'[^']*'/S/g" -e 's/"[^"]*"/S/g' \
+norm() { sed -e '/^usage() {/,/^}/d' \
+             -e 's/#.*$//' -e "s/'[^']*'/S/g" -e 's/"[^"]*"/S/g' \
              -e 's/[[:space:]]\+/ /g' "$1" | grep -v '^ *$'; }
 diff <(norm smart-monitor.de.sh) <(norm smart-monitor.en.sh)
 ```
