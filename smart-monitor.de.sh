@@ -29,7 +29,7 @@ set -o pipefail
 export LC_ALL=C
 
 PROGNAME="${0##*/}"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --- Konstanten --------------------------------------------------------------
 
@@ -56,6 +56,7 @@ OPT_ACTION=""
 
 SMARTCTL_BIN=""
 SMART_TARGET=""
+SMART_INFO=""
 declare -a SMART_ARGS=()
 
 declare -a DISK_DEV=()
@@ -248,30 +249,32 @@ smart_target() {
 }
 
 # Ermittelt einmalig Ziel und -d-Argumente für das gewählte Gerät.
-# Setzt die globalen Variablen SMART_TARGET und SMART_ARGS.
+# Setzt die globalen Variablen SMART_TARGET, SMART_ARGS und SMART_INFO.
+#
+# "-d sat,12" steht bewusst vor "-d scsi": SCSI-Zugriff klappt bei fast jedem
+# USB-Gehäuse, liefert aber keine ATA-Werte. Dahinter käme sat,12 nie zum Zug.
 resolve_smart_access() {
-  local dev="$1" try
-  local -a candidates=("" "-d sat" "-d nvme" "-d scsi" "-d sat,12" "-d ata")
+  local dev="$1" try out
+  local -a candidates=("" "-d sat" "-d sat,12" "-d nvme" "-d scsi" "-d ata")
   local -a extra=()
 
   SMART_TARGET="$(smart_target "$dev")"
   SMART_ARGS=()
+  SMART_INFO=""
 
   for try in "${candidates[@]}"; do
     extra=()
     [[ -n $try ]] && read -r -a extra <<<"$try"
 
     if (( ${#extra[@]} > 0 )); then
-      if smart_exec "$SMARTCTL_BIN" "${extra[@]}" -i "$SMART_TARGET" >/dev/null 2>&1; then
-        SMART_ARGS=("${extra[@]}")
-        return 0
-      fi
+      out="$(smart_exec "$SMARTCTL_BIN" "${extra[@]}" -i "$SMART_TARGET" 2>&1)" || continue
+      SMART_ARGS=("${extra[@]}")
     else
-      if smart_exec "$SMARTCTL_BIN" -i "$SMART_TARGET" >/dev/null 2>&1; then
-        SMART_ARGS=()
-        return 0
-      fi
+      out="$(smart_exec "$SMARTCTL_BIN" -i "$SMART_TARGET" 2>&1)" || continue
+      SMART_ARGS=()
     fi
+    SMART_INFO="$out"
+    return 0
   done
 
   return 1
@@ -304,12 +307,32 @@ device_proto() {
   esac
 }
 
-# Für Fortschritt und Attributauswertung gibt es nur zwei Parser-Familien.
+# Für Fortschritt und Attributauswertung gibt es drei Parser-Familien.
 parser_family() {
   case "$1" in
     nvme) printf 'nvme' ;;
+    scsi) printf 'scsi' ;;
     *)    printf 'ata' ;;
   esac
+}
+
+# Bestimmt die Parser-Familie aus der Antwort von "smartctl -i".
+# Das ist verlässlicher als Gerätename und lsblk-TRAN: eine NVMe-SSD in einem
+# USB-Gehäuse oder eine SAS-Platte ohne TRAN-Angabe würde sonst mit dem
+# falschen Parser ausgewertet. Nur wenn die Ausgabe nichts hergibt, entscheidet
+# der Transport.
+detect_family() {
+  local info="$1" proto="$2"
+
+  if grep -qE '^(NVMe Version|Model Number):' <<<"$info"; then
+    printf 'nvme'
+  elif grep -qE '^(Device Model|ATA Version is|SATA Version is):' <<<"$info"; then
+    printf 'ata'
+  elif grep -qE '^(Vendor|Product):' <<<"$info"; then
+    printf 'scsi'
+  else
+    parser_family "$proto"
+  fi
 }
 
 # --- Voraussetzungen ---------------------------------------------------------
@@ -363,6 +386,9 @@ collect_disks() {
 
     [[ ${lsb[TYPE]:-} == "disk" ]] || continue
     [[ -n ${lsb[NAME]:-} ]] || continue
+    # zram ist ein Laufwerk im Arbeitsspeicher, 0B meist ein leerer
+    # Kartenleser. Beides hat kein SMART und würde die Liste nur verlängern.
+    [[ ${lsb[NAME]} == zram* || ${lsb[SIZE]:-} == "0B" ]] && continue
 
     dev="/dev/${lsb[NAME]}"
     size="${lsb[SIZE]:-}"
@@ -419,7 +445,10 @@ select_device() {
       err "$OPT_DEVICE ist kein vorhandenes Blockgerät."
       exit $EXIT_USAGE
     fi
-    sel_dev="$OPT_DEVICE"
+    # Symlinks wie /dev/disk/by-id/... auflösen. Sonst passen weder die
+    # lsblk-Daten noch die Zuordnung zum NVMe-Controller-Knoten.
+    sel_dev="$(readlink -f -- "$OPT_DEVICE" 2>/dev/null || true)"
+    [[ -n $sel_dev ]] || sel_dev="$OPT_DEVICE"
     adopt_metadata "$sel_dev"
     return 0
   fi
@@ -479,16 +508,22 @@ select_action() {
 selftest_supported() {
   local family="$1" out
 
-  out="$(smartctl_dev -c 2>/dev/null || true)"
-
   case "$family" in
     nvme)
       # Bei NVMe steht die Self-Test-Fähigkeit je nach smartctl-Version in
       # der Capabilities- oder in der Info-Ausgabe.
+      out="$(smartctl_dev -c 2>/dev/null || true)"
       out+=$'\n'"$(smartctl_dev -i 2>/dev/null || true)"
       grep -qiE 'Self[-_ ]?Test' <<<"$out"
       ;;
+    scsi)
+      # SCSI kennt keine Capabilities-Ausgabe. Fehlt das Selbsttest-Log,
+      # fehlen in aller Regel auch die Selbsttests.
+      out="$(smartctl_dev -l selftest 2>/dev/null || true)"
+      ! grep -qiE 'does not support Self[- ]?Test' <<<"$out"
+      ;;
     *)
+      out="$(smartctl_dev -c 2>/dev/null || true)"
       grep -qiE 'Short self-test routine' <<<"$out"
       ;;
   esac
@@ -501,7 +536,18 @@ selftest_supported() {
 #   recommended polling time:        (   2) minutes.
 # Ein Grep auf die zusammenhängende Phrase findet daher nie etwas.
 recommended_minutes() {
-  local mode="$1" out key val
+  local mode="$1" family="$2" out key val
+
+  if [[ $family == "scsi" ]]; then
+    # SCSI nennt nur die Dauer des erweiterten Tests, in Sekunden und im
+    # Selbsttest-Log: "Long (extended) Self-test duration: 6000 seconds".
+    [[ $mode == "long" ]] || { printf ''; return 0; }
+    out="$(smartctl_dev -l selftest 2>/dev/null || true)"
+    val=$(grep -oiE 'Long \(extended\).*duration:[[:space:]]*[0-9]+' <<<"$out" \
+          | grep -oE '[0-9]+$' | head -n1 || true)
+    is_int "$val" && printf '%s' "$(( (val + 59) / 60 ))"
+    return 0
+  fi
 
   out="$(smartctl_dev -c 2>/dev/null || true)"
 
@@ -556,6 +602,19 @@ poll_selftest_state() {
         fi
       fi
       ;;
+    scsi)
+      # SCSI/SAS: "-c" sagt hier nichts. Laufzustand und (je nach Laufwerk)
+      # Fortschritt stehen im Selbsttest-Log; der laufende Test ist dort der
+      # oberste Eintrag mit "Self test in progress ...".
+      out="$(smartctl_dev -l selftest 2>/dev/null || true)"
+
+      rem=$(grep -oE '[0-9]+% of test remaining' <<<"$out" | grep -oE '^[0-9]+' | head -n1 || true)
+      is_int "$rem" && POLL_PCT=$(( 100 - rem ))
+
+      if [[ -n $POLL_PCT ]] || grep -qiE 'in progress' <<<"$(last_selftest_line "$out")"; then
+        POLL_RUNNING=1
+      fi
+      ;;
     *)
       out="$(smartctl_dev -c 2>/dev/null || true)"
 
@@ -575,6 +634,80 @@ poll_selftest_state() {
 selftest_is_running() {
   poll_selftest_state "$1"
   (( POLL_RUNNING == 1 ))
+}
+
+# Art eines bereits laufenden Tests (short / long), soweit das Selbsttest-Log
+# das verrät. Ohne Treffer bleibt die Ausgabe leer.
+running_test_mode() {
+  local out line
+  out="$(smartctl_dev -l selftest 2>/dev/null || true)"
+  line="$(grep -iE 'in progress' <<<"$out" | grep -viE 'no self-test in progress' | head -n1 || true)"
+  case "$(lower "$line")" in
+    *short*)           printf 'short' ;;
+    *extended*|*long*) printf 'long' ;;
+  esac
+  return 0
+}
+
+# --- Restzeit aus gemessenem Fortschritt -------------------------------------
+#
+# Die Firmware meldet den Fortschritt in Stufen: ATA in 10-%-Schritten, NVMe in
+# 1-%-Schritten. ATA meldet außerdem direkt nach dem Start schon
+# "90% of test remaining". Rechnet man einfach "vergangene Zeit / Prozent"
+# hoch, kommt bei einem mehrstündigen Test anfangs eine Restzeit von wenigen
+# Minuten heraus, die dann bis zum nächsten Sprung immer weiter wächst.
+#
+# Gemessen wird deshalb nur zwischen Stufenwechseln: vom Startpunkt (Teststart,
+# bei einem übernommenen Test der erste beobachtete Wechsel) bis zum jüngsten
+# Wechsel. Zwischen zwei Wechseln zählt die Restzeit herunter, fällt aber nie
+# unter den Wert, der beim Erreichen der nächsten Stufe gelten würde.
+PROG_PREV=""
+PROG_STEP=0
+PROG_T0=""
+PROG_P0=""
+PROG_T1=""
+PROG_P1=""
+
+# $1 = gemeldeter Prozentwert, $2 = jetzt, $3 = Teststart (leer bei einem
+# übernommenen Test, dessen Startzeitpunkt wir nicht kennen)
+progress_track() {
+  local pct="$1" now="$2" start="$3"
+
+  if [[ -z $PROG_PREV ]]; then
+    PROG_PREV=$pct
+    if [[ -n $start ]]; then
+      PROG_T0=$start
+      PROG_P0=$pct
+    fi
+  elif (( pct > PROG_PREV )); then
+    PROG_STEP=$(( pct - PROG_PREV ))
+    PROG_PREV=$pct
+    if [[ -z $PROG_T0 ]]; then
+      PROG_T0=$now
+      PROG_P0=$pct
+    else
+      PROG_T1=$now
+      PROG_P1=$pct
+    fi
+  fi
+  return 0
+}
+
+# Gibt die Restzeit in Sekunden aus, oder nichts, solange noch kein
+# Stufenwechsel gemessen wurde.
+progress_remaining() {
+  local now="$1" span gained rem floor
+
+  [[ -n $PROG_T1 ]] || return 0
+  span=$(( PROG_T1 - PROG_T0 ))
+  gained=$(( PROG_P1 - PROG_P0 ))
+  (( span > 0 && gained > 0 )) || return 0
+
+  rem=$(( (100 - PROG_P1) * span / gained - (now - PROG_T1) ))
+  floor=$(( (100 - PROG_P1 - PROG_STEP) * span / gained ))
+  (( rem < floor )) && rem=$floor
+  (( rem < 0 )) && rem=0
+  printf '%s' "$rem"
 }
 
 abort_selftest() {
@@ -603,7 +736,7 @@ start_selftest() {
   local mode="$1" family="$2"
   local start_ts now elapsed pct remaining est_total est_min rem_txt
   local running=0 seen_running=0 attached=0 interval line last_pct=-1
-  local is_tty=0 max_pct=0
+  local is_tty=0 max_pct=0 idle_polls=0 track_start="" running_mode result=""
 
   [[ -t 1 ]] && is_tty=1
 
@@ -617,7 +750,11 @@ start_selftest() {
   fi
 
   if selftest_is_running "$family"; then
-    warn "Es läuft bereits ein Selbsttest. Es wird kein neuer gestartet, der laufende wird beobachtet."
+    # Der laufende Test kann eine andere Art haben als die gewählte. Für die
+    # Herstellerschätzung zählt die Art des laufenden Tests.
+    running_mode="$(running_test_mode)"
+    [[ -n $running_mode ]] && mode="$running_mode"
+    warn "Es läuft bereits ein Selbsttest ($mode). Es wird kein neuer gestartet, der laufende wird beobachtet."
     attached=1
     seen_running=1
     echo
@@ -629,9 +766,12 @@ start_selftest() {
   fi
 
   start_ts=$(date +%s)
-  est_min="$(recommended_minutes "$mode")"
+  est_min="$(recommended_minutes "$mode" "$family")"
   est_total=0
   is_int "$est_min" && est_total=$(( est_min * 60 ))
+  (( attached )) || track_start=$start_ts
+
+  PROG_PREV=""; PROG_STEP=0; PROG_T0=""; PROG_P0=""; PROG_T1=""; PROG_P1=""
 
   echo
   info "Fortschritt wird abgefragt. Strg+C beendet nur die Anzeige, der Test läuft weiter."
@@ -644,26 +784,42 @@ start_selftest() {
     poll_selftest_state "$family"
     running=$POLL_RUNNING
     pct="$POLL_PCT"
-    (( running == 1 )) && seen_running=1
 
     now=$(date +%s)
     elapsed=$(( now - start_ts ))
 
-    remaining=""
-    if is_int "$pct"; then
+    if (( running == 1 )); then
+      seen_running=1
+      idle_polls=0
+    else
+      idle_polls=$(( idle_polls + 1 ))
+    fi
+
+    line=""
+    if (( running == 0 && seen_running == 1 )); then
+      # Entweder ist der Test fertig, oder eine einzelne Abfrage ist
+      # danebengegangen. Die Anzeige bleibt stehen, bis die nächste Abfrage
+      # das bestätigt.
+      :
+    elif is_int "$pct"; then
+      progress_track "$pct" "$now" "$track_start"
+
+      remaining=""
       if (( pct >= 100 )); then
         remaining=0
-      elif (( attached == 0 && pct > 0 && elapsed >= 15 )); then
-        # Gemessener Fortschritt hochgerechnet. Erst ab etwas Laufzeit
-        # sinnvoll, vorher schwankt die Schätzung extrem.
-        remaining=$(( elapsed * 100 / pct - elapsed ))
-      elif (( est_total > 0 )); then
-        # Bei einem übernommenen Test kennen wir den echten Startzeitpunkt
-        # nicht; dann trägt nur die Herstellerschätzung.
-        remaining=$(( est_total * (100 - pct) / 100 ))
+      else
+        remaining="$(progress_remaining "$now")"
+        if [[ -z $remaining ]] && (( est_total > 0 )); then
+          # Noch kein Stufenwechsel gemessen: Herstellerangabe nutzen.
+          if (( attached )); then
+            # Bei einem übernommenen Test kennen wir den echten Startzeitpunkt
+            # nicht, nur den gemeldeten Fortschritt.
+            remaining=$(( est_total * (100 - pct) / 100 ))
+          elif (( elapsed < est_total )); then
+            remaining=$(( est_total - elapsed ))
+          fi
+        fi
       fi
-
-      [[ -n $remaining ]] && (( remaining < 0 )) && remaining=0
 
       rem_txt="-"
       [[ -n $remaining ]] && rem_txt="$(human_duration "$remaining")"
@@ -687,7 +843,9 @@ start_selftest() {
 
     is_int "$pct" && (( pct > max_pct )) && max_pct=$pct
 
-    if (( is_tty )); then
+    if [[ -z $line ]]; then
+      :
+    elif (( is_tty )); then
       printf '\r\033[K%s' "$line"
     elif [[ $pct != "$last_pct" ]]; then
       # Ohne Terminal wäre eine Statuszeile pro Abfrage nur Rauschen.
@@ -698,13 +856,17 @@ start_selftest() {
     (( WATCH_ABORT )) && break
 
     if (( running == 0 )); then
-      # Erst abbrechen, wenn der Test wirklich lief oder die Anlaufzeit vorbei ist.
-      if (( seen_running == 1 || elapsed >= START_GRACE )); then
+      # Erst aufhören, wenn zwei Abfragen in Folge keinen Test mehr sehen,
+      # oder wenn der Test nach der Anlaufzeit noch immer nicht läuft.
+      if (( seen_running == 1 && idle_polls >= 2 )); then
+        break
+      fi
+      if (( seen_running == 0 && elapsed >= START_GRACE )); then
         break
       fi
     fi
 
-    if (( seen_running )); then
+    if (( seen_running && running )); then
       interval=$POLL_INTERVAL
     else
       interval=$STARTUP_INTERVAL
@@ -717,13 +879,18 @@ start_selftest() {
   trap - INT
 
   if (( WATCH_ABORT == 0 && seen_running == 1 )); then
-    # Der Test ist durchgelaufen: Balken sauber auf 100 % schließen.
-    line=$(printf '%s %3d%%  vergangen: %s  verbleibend: %s' \
-      "$(bar_for_percent 100 "$BAR_WIDTH")" 100 "$(human_duration "$elapsed")" "0s")
-    if (( is_tty )); then
-      printf '\r\033[K%s' "$line"
-    else
-      printf '%s\n' "$line"
+    # Wie ist der Test ausgegangen? Ein Abbruch oder Lesefehler darf nicht
+    # als voller Balken enden.
+    result="$(selftest_line_status "$(last_selftest_line "$(smartctl_dev -l selftest 2>/dev/null || true)")")"
+
+    if [[ $result == "ok" || $result == "unknown" ]]; then
+      line=$(printf '%s %3d%%  vergangen: %s  verbleibend: %s' \
+        "$(bar_for_percent 100 "$BAR_WIDTH")" 100 "$(human_duration "$elapsed")" "0s")
+      if (( is_tty )); then
+        printf '\r\033[K%s' "$line"
+      else
+        printf '%s\n' "$line"
+      fi
     fi
   fi
 
@@ -734,6 +901,10 @@ start_selftest() {
     info "Anzeige abgebrochen. Der Test läuft im Hintergrund weiter."
   elif (( seen_running == 0 )); then
     warn "Es wurde kein laufender Selbsttest erkannt. Entweder war er sofort fertig oder das Laufwerk unterstützt ihn nicht."
+  elif [[ $result == "failed" ]]; then
+    warn "Der Test ist beendet, aber nicht fehlerfrei. Details stehen im Selbsttest-Log unten."
+  elif [[ $result == "aborted" ]]; then
+    warn "Der Test wurde abgebrochen, bevor er fertig war."
   else
     info "Test abgeschlossen."
   fi
@@ -766,7 +937,31 @@ ata_field() {
 ata_raw() { ata_field "$1" "RAW_VALUE" "$2"; }
 ata_val() { ata_field "$1" "VALUE"     "$2"; }
 
-nvme_field() {
+# Listet Attribute, die gerade unter ihrer Herstellerschwelle liegen
+# (WHEN_FAILED = FAILING_NOW, im "brief"-Format FAIL = NOW).
+# $1 = "pre" für Pre-fail-Attribute (Ausfallvorboten), "old" für Old_age.
+ata_failing_now() {
+  local want="$1" text="$2"
+  awk -v want="$want" '
+    /ATTRIBUTE_NAME/ {
+      wf = ty = fa = fl = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i == "WHEN_FAILED") wf = i
+        if ($i == "TYPE")        ty = i
+        if ($i == "FAIL")        fa = i
+        if ($i == "FLAGS")       fl = i
+      }
+      next
+    }
+    (wf && ty && $wf == "FAILING_NOW") || (fa && fl && $fa == "NOW") {
+      pre = wf ? ($ty == "Pre-fail") : (substr($fl, 1, 1) == "P")
+      if ((want == "pre") == pre) { printf "%s%s", sep, $2; sep = ", " }
+    }
+  ' <<<"$text"
+}
+
+# Liest eine "Schlüssel: Wert"-Zeile, wie sie smartctl für NVMe und SCSI druckt.
+kv_field() {
   local key="$1" text="$2" val
   val=$(grep -iE "^${key}:" <<<"$text" | head -n1 | cut -d: -f2- || true)
   trim "$val"
@@ -791,6 +986,10 @@ health_state_from() {
   if grep -qiE 'FAILING_NOW' <<<"$out"; then
     printf 'FAILED'; return 0
   fi
+  # SCSI/SAS: "WARNING - TEMPERATURE THRESHOLD EXCEEDED" und ähnliche.
+  if grep -qiE '^SMART Health Status:[[:space:]]*WARNING' <<<"$out"; then
+    printf 'WARNUNG'; return 0
+  fi
 
   printf 'UNBEKANNT'
 }
@@ -812,28 +1011,52 @@ last_selftest_line() {
   ' <<<"$out"
 }
 
-# 0 = in Ordnung oder unbestimmt, 1 = der letzte Test ist fehlgeschlagen
-selftest_line_ok() {
+# Ordnet einen Selbsttest-Logeintrag ein:
+#   ok      = fehlerfrei abgeschlossen
+#   failed  = mit Fehler beendet (Lesefehler, fehlgeschlagenes Segment ...)
+#   aborted = abgebrochen oder unterbrochen, sagt nichts über das Laufwerk
+#   unknown = kein Eintrag oder Test noch "in progress"
+selftest_line_status() {
   local line="$1"
-  [[ -n $line ]] || return 0
-  grep -qiE 'without error|Completed[[:space:]]*$' <<<"$line" && return 0
-  grep -qiE 'in progress|Aborted|Interrupted|Self-test routine in progress' <<<"$line" && return 0
-  grep -qiE 'failure|failed|error|unknown failure' <<<"$line" && return 1
-  return 0
+
+  if [[ -z $line ]]; then
+    printf 'unknown'
+  elif grep -qiE 'without error' <<<"$line"; then
+    printf 'ok'
+  elif grep -qiE 'in progress' <<<"$line"; then
+    printf 'unknown'
+  elif grep -qiE 'abort|interrupt' <<<"$line"; then
+    printf 'aborted'
+  elif grep -qiE 'fail|error' <<<"$line"; then
+    printf 'failed'
+  else
+    # z. B. SCSI: schlicht "Completed"
+    printf 'ok'
+  fi
+}
+
+# Kurzbeschreibung zu selftest_line_status für die Werteliste.
+selftest_status_text() {
+  case "$1" in
+    ok)      printf 'fehlerfrei' ;;
+    failed)  printf 'mit Fehler beendet' ;;
+    aborted) printf 'abgebrochen' ;;
+    *)       printf 'unbekannt' ;;
+  esac
 }
 
 summary_nvme() {
-  local health_state="$1" attrs="$2"
+  local health_state="$1" attrs="$2" st_status="${3:-unknown}"
   local temp pct_used spare spare_thr crit media_err poh
   local verdict message
 
-  temp="$(nvme_field 'Temperature' "$attrs")"
-  pct_used="$(nvme_field 'Percentage Used' "$attrs")"
-  spare="$(nvme_field 'Available Spare' "$attrs")"
-  spare_thr="$(nvme_field 'Available Spare Threshold' "$attrs")"
-  crit="$(nvme_field 'Critical Warning' "$attrs")"
-  media_err="$(nvme_field 'Media and Data Integrity Errors' "$attrs")"
-  poh="$(nvme_field 'Power On Hours' "$attrs")"
+  temp="$(kv_field 'Temperature' "$attrs")"
+  pct_used="$(kv_field 'Percentage Used' "$attrs")"
+  spare="$(kv_field 'Available Spare' "$attrs")"
+  spare_thr="$(kv_field 'Available Spare Threshold' "$attrs")"
+  crit="$(kv_field 'Critical Warning' "$attrs")"
+  media_err="$(kv_field 'Media and Data Integrity Errors' "$attrs")"
+  poh="$(kv_field 'Power On Hours' "$attrs")"
 
   if [[ $health_state == "FAILED" ]]; then
     verdict="Kritisch"
@@ -848,6 +1071,10 @@ summary_nvme() {
     verdict="Auffällig"
     message="Die NVMe meldet eine kritische Warnung. Das Laufwerk sollte beobachtet und zeitnah gesichert werden."
     escalate $EXIT_WARN
+  elif [[ $st_status == "failed" ]]; then
+    verdict="Auffällig"
+    message="Der jüngste Selbsttest wurde nicht fehlerfrei beendet. Backup anlegen und das Laufwerk im Auge behalten."
+    escalate $EXIT_WARN
   elif (( $(num_or "$pct_used" 0) >= 90 )); then
     verdict="Abgenutzt"
     message="Die SSD hat schon viel Lebensdauer verbraucht. Sie läuft noch, aber das Ende rückt näher."
@@ -856,7 +1083,8 @@ summary_nvme() {
     verdict="Auffällig"
     message="Es wurden Medien-/Datenfehler gezählt. Ein Backup ist sinnvoll, auch wenn das Laufwerk noch arbeiten kann."
     escalate $EXIT_WARN
-  elif [[ $health_state == "UNBEKANNT" && -z $attrs ]]; then
+  elif [[ $health_state == "UNBEKANNT" && -z $temp$pct_used$spare$crit$media_err$poh ]]; then
+    # $attrs selbst ist nie leer: smartctl schreibt immer seinen Vorspann.
     verdict="Unbekannt"
     message="Es konnten keine SMART-Werte gelesen werden. Der Zustand lässt sich nicht beurteilen."
     escalate $EXIT_WARN
@@ -871,6 +1099,7 @@ summary_nvme() {
   echo
   echo "Wichtige Werte:"
   echo "- SMART-Health: ${health_state}"
+  [[ $st_status != "unknown" ]] && echo "- Letzter Selbsttest: $(selftest_status_text "$st_status")"
   [[ -n $temp      ]] && echo "- Temperatur: ${temp}"
   [[ -n $pct_used  ]] && echo "- Verschleiß (Percentage Used): ${pct_used}"
   [[ -n $spare     ]] && echo "- Verbleibende Reserve: ${spare}"
@@ -881,9 +1110,70 @@ summary_nvme() {
   return 0
 }
 
+# SAS/SCSI hat keine Attributtabelle, sondern einzelne Zeilen wie
+# "Elements in grown defect list: 0". Die Grown Defect List ist das Gegenstück
+# zu den Reallocated Sectors bei ATA; "Percentage used endurance indicator"
+# gibt es nur bei SAS-SSDs.
+summary_scsi() {
+  local health_state="$1" attrs="$2" st_status="${3:-unknown}"
+  local temp defects endurance poh
+  local verdict message
+
+  temp="$(kv_field 'Current Drive Temperature' "$attrs")"
+  [[ $temp =~ [0-9] ]] || temp=""
+  defects="$(kv_field 'Elements in grown defect list' "$attrs")"
+  endurance="$(kv_field 'Percentage used endurance indicator' "$attrs")"
+  poh=$(grep -oiE 'Accumulated power on time, hours:minutes[[:space:]]+[0-9]+' <<<"$attrs" \
+        | grep -oE '[0-9]+$' | head -n1 || true)
+
+  if [[ $health_state == "FAILED" ]]; then
+    verdict="Kritisch"
+    message="SMART meldet einen klaren Fehler. Bitte sofort sichern und das Laufwerk ersetzen."
+    escalate $EXIT_CRIT
+  elif [[ $health_state == "WARNUNG" ]]; then
+    verdict="Auffällig"
+    message="Das Laufwerk meldet über den SMART-Status eine Warnung, etwa zur Temperatur. Details zeigt Aktion 1."
+    escalate $EXIT_WARN
+  elif (( $(num_or "$defects" 0) > 0 )); then
+    verdict="Auffällig"
+    message="Es gibt auffällige Speicherblöcke. Noch kein Totalschaden, aber Backup und Kontrolle sind ratsam."
+    escalate $EXIT_WARN
+  elif [[ $st_status == "failed" ]]; then
+    verdict="Auffällig"
+    message="Der jüngste Selbsttest wurde nicht fehlerfrei beendet. Backup anlegen und das Laufwerk im Auge behalten."
+    escalate $EXIT_WARN
+  elif (( $(num_or "$endurance" 0) >= 90 )); then
+    verdict="Abgenutzt"
+    message="Die SSD hat schon viel Lebensdauer verbraucht. Sie läuft noch, aber das Ende rückt näher."
+    escalate $EXIT_WARN
+  elif [[ $health_state == "UNBEKANNT" && -z $temp$defects$endurance$poh ]]; then
+    # $attrs selbst ist nie leer: smartctl schreibt immer seinen Vorspann.
+    verdict="Unbekannt"
+    message="Es konnten keine SMART-Werte gelesen werden. Der Zustand lässt sich nicht beurteilen."
+    escalate $EXIT_WARN
+  else
+    verdict="Unauffällig"
+    message="Das Laufwerk wirkt aktuell gesund und unauffällig."
+  fi
+
+  echo
+  printf 'Zustand: %s\n' "$verdict"
+  echo "$message"
+  echo
+  echo "Wichtige Werte:"
+  echo "- SMART-Health: ${health_state}"
+  [[ $st_status != "unknown" ]] && echo "- Letzter Selbsttest: $(selftest_status_text "$st_status")"
+  [[ -n $temp      ]] && echo "- Temperatur: ${temp}"
+  [[ -n $poh       ]] && echo "- Betriebsstunden: ${poh}"
+  [[ -n $endurance ]] && echo "- Verschleiß (Percentage used endurance): ${endurance}"
+  [[ -n $defects   ]] && echo "- Grown Defects: ${defects}"
+  return 0
+}
+
 summary_ata() {
-  local health_state="$1" attrs="$2"
+  local health_state="$1" attrs="$2" st_status="${3:-unknown}"
   local realloc realloc_ev pending uncorr temp wear poh wear_num
+  local failing_pre failing_old has_table=0
   local verdict message
 
   realloc="$(ata_raw Reallocated_Sector_Ct "$attrs")"
@@ -901,9 +1191,19 @@ summary_ata() {
   [[ -z $wear ]] && wear="$(ata_val SSD_Life_Left "$attrs")"
   wear_num="$(num_value "$wear")"
 
+  # smartctl -H meldet PASSED, solange nur Old_age-Attribute oder einzelne
+  # Werte unter der Schwelle liegen. Deshalb die Tabelle selbst prüfen.
+  failing_pre="$(ata_failing_now pre "$attrs")"
+  failing_old="$(ata_failing_now old "$attrs")"
+  grep -q 'ATTRIBUTE_NAME' <<<"$attrs" && has_table=1
+
   if [[ $health_state == "FAILED" ]]; then
     verdict="Kritisch"
     message="SMART meldet einen klaren Fehler. Bitte sofort sichern und das Laufwerk ersetzen."
+    escalate $EXIT_CRIT
+  elif [[ -n $failing_pre ]]; then
+    verdict="Kritisch"
+    message="Ein Ausfallvorbote liegt unter der Herstellerschwelle (${failing_pre}). Bitte sofort sichern und das Laufwerk ersetzen."
     escalate $EXIT_CRIT
   elif (( $(num_or "$realloc" 0)    > 0 )) \
     || (( $(num_or "$realloc_ev" 0) > 0 )) \
@@ -912,11 +1212,20 @@ summary_ata() {
     verdict="Auffällig"
     message="Es gibt auffällige Speicherblöcke. Noch kein Totalschaden, aber Backup und Kontrolle sind ratsam."
     escalate $EXIT_WARN
+  elif [[ $st_status == "failed" ]]; then
+    verdict="Auffällig"
+    message="Der jüngste Selbsttest wurde nicht fehlerfrei beendet. Backup anlegen und das Laufwerk im Auge behalten."
+    escalate $EXIT_WARN
+  elif [[ -n $failing_old ]]; then
+    verdict="Auffällig"
+    message="Ein Alterungswert liegt gerade unter der Herstellerschwelle (${failing_old}). Ursache prüfen, Backup ist ratsam."
+    escalate $EXIT_WARN
   elif is_int "$wear_num" && (( wear_num < 20 )); then
     verdict="Stark genutzt"
     message="Die Restlebensdauer liegt unter 20 Prozent. Das Laufwerk ist noch nutzbar, Ersatz sollte eingeplant werden."
     escalate $EXIT_WARN
-  elif [[ $health_state == "UNBEKANNT" && -z $attrs ]]; then
+  elif [[ $health_state == "UNBEKANNT" ]] && (( has_table == 0 )); then
+    # $attrs selbst ist nie leer: smartctl schreibt immer seinen Vorspann.
     verdict="Unbekannt"
     message="Es konnten keine SMART-Werte gelesen werden. Der Zustand lässt sich nicht beurteilen."
     escalate $EXIT_WARN
@@ -931,6 +1240,7 @@ summary_ata() {
   echo
   echo "Wichtige Werte:"
   echo "- SMART-Health: ${health_state}"
+  [[ $st_status != "unknown" ]] && echo "- Letzter Selbsttest: $(selftest_status_text "$st_status")"
   [[ -n $temp       ]] && echo "- Temperatur: ${temp} °C"
   [[ -n $poh        ]] && echo "- Betriebsstunden: ${poh}"
   [[ -n $wear_num   ]] && echo "- Restlebensdauer (normalisiert): ${wear_num} %"
@@ -943,27 +1253,23 @@ summary_ata() {
 
 friendly_summary() {
   local family="$1"
-  local health_output health_state attrs selftest_log last_line
+  local health_output health_state attrs selftest_log st_status
 
   health_output="$(smartctl_dev -H 2>/dev/null || true)"
   health_state="$(health_state_from "$health_output")"
 
   attrs="$(smartctl_dev -A 2>/dev/null || true)"
 
-  if [[ $family == "nvme" ]]; then
-    summary_nvme "$health_state" "$attrs"
-  else
-    summary_ata "$health_state" "$attrs"
-  fi
-
+  # Ein fehlgeschlagener Selbsttest gehört in die Bewertung selbst. Sonst
+  # stünde "Zustand: Unauffällig" direkt über einem Lesefehler im Log.
   selftest_log="$(smartctl_dev -l selftest 2>/dev/null || true)"
-  last_line="$(last_selftest_line "$selftest_log")"
+  st_status="$(selftest_line_status "$(last_selftest_line "$selftest_log")")"
 
-  if [[ -n $last_line ]] && ! selftest_line_ok "$last_line"; then
-    escalate $EXIT_WARN
-    echo
-    warn "Der jüngste Selbsttest wurde nicht fehlerfrei beendet."
-  fi
+  case "$family" in
+    nvme) summary_nvme "$health_state" "$attrs" "$st_status" ;;
+    scsi) summary_scsi "$health_state" "$attrs" "$st_status" ;;
+    *)    summary_ata  "$health_state" "$attrs" "$st_status" ;;
+  esac
 
   echo
   echo "Letztes Selbsttest-Log:"
@@ -1008,11 +1314,17 @@ main() {
   select_device
 
   sel_proto="$(device_proto "$sel_dev" "$sel_tran")"
-  sel_family="$(parser_family "$sel_proto")"
 
   if ! resolve_smart_access "$sel_dev"; then
     err "smartctl kann $(smart_target "$sel_dev") nicht ansprechen (auch nicht mit -d sat/nvme/scsi)."
     exit $EXIT_USAGE
+  fi
+
+  # Was tatsächlich antwortet, zählt mehr als der Gerätename. "sata" ist nur
+  # die Vorgabe für Geräte ohne TRAN-Angabe und wird dann korrigiert.
+  sel_family="$(detect_family "$SMART_INFO" "$sel_proto")"
+  if [[ $sel_proto == "sata" && $sel_family != "ata" ]]; then
+    sel_proto="$sel_family"
   fi
 
   echo
