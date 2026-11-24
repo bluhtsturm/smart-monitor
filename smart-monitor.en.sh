@@ -28,7 +28,7 @@ set -o pipefail
 export LC_ALL=C
 
 PROGNAME="${0##*/}"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --- Constants ---------------------------------------------------------------
 
@@ -958,7 +958,8 @@ ata_failing_now() {
   ' <<<"$text"
 }
 
-nvme_field() {
+# Reads a "key: value" line as smartctl prints it for NVMe and SCSI.
+kv_field() {
   local key="$1" text="$2" val
   val=$(grep -iE "^${key}:" <<<"$text" | head -n1 | cut -d: -f2- || true)
   trim "$val"
@@ -982,6 +983,10 @@ health_state_from() {
   fi
   if grep -qiE 'FAILING_NOW' <<<"$out"; then
     printf 'FAILED'; return 0
+  fi
+  # SCSI/SAS: "WARNING - TEMPERATURE THRESHOLD EXCEEDED" and the like.
+  if grep -qiE '^SMART Health Status:[[:space:]]*WARNING' <<<"$out"; then
+    printf 'WARNING'; return 0
   fi
 
   printf 'UNKNOWN'
@@ -1043,13 +1048,13 @@ summary_nvme() {
   local temp pct_used spare spare_thr crit media_err poh
   local verdict message
 
-  temp="$(nvme_field 'Temperature' "$attrs")"
-  pct_used="$(nvme_field 'Percentage Used' "$attrs")"
-  spare="$(nvme_field 'Available Spare' "$attrs")"
-  spare_thr="$(nvme_field 'Available Spare Threshold' "$attrs")"
-  crit="$(nvme_field 'Critical Warning' "$attrs")"
-  media_err="$(nvme_field 'Media and Data Integrity Errors' "$attrs")"
-  poh="$(nvme_field 'Power On Hours' "$attrs")"
+  temp="$(kv_field 'Temperature' "$attrs")"
+  pct_used="$(kv_field 'Percentage Used' "$attrs")"
+  spare="$(kv_field 'Available Spare' "$attrs")"
+  spare_thr="$(kv_field 'Available Spare Threshold' "$attrs")"
+  crit="$(kv_field 'Critical Warning' "$attrs")"
+  media_err="$(kv_field 'Media and Data Integrity Errors' "$attrs")"
+  poh="$(kv_field 'Power On Hours' "$attrs")"
 
   if [[ $health_state == "FAILED" ]]; then
     verdict="Critical"
@@ -1100,6 +1105,66 @@ summary_nvme() {
   [[ -n $crit      ]] && echo "- Critical warning: ${crit}"
   [[ -n $media_err ]] && echo "- Media/data errors: ${media_err}"
   [[ -n $poh       ]] && echo "- Power-on hours: ${poh}"
+  return 0
+}
+
+# SAS/SCSI has no attribute table, just single lines such as
+# "Elements in grown defect list: 0". The grown defect list is the counterpart
+# of ATA's reallocated sectors; "Percentage used endurance indicator" only
+# exists on SAS SSDs.
+summary_scsi() {
+  local health_state="$1" attrs="$2" st_status="${3:-unknown}"
+  local temp defects endurance poh
+  local verdict message
+
+  temp="$(kv_field 'Current Drive Temperature' "$attrs")"
+  [[ $temp =~ [0-9] ]] || temp=""
+  defects="$(kv_field 'Elements in grown defect list' "$attrs")"
+  endurance="$(kv_field 'Percentage used endurance indicator' "$attrs")"
+  poh=$(grep -oiE 'Accumulated power on time, hours:minutes[[:space:]]+[0-9]+' <<<"$attrs" \
+        | grep -oE '[0-9]+$' | head -n1 || true)
+
+  if [[ $health_state == "FAILED" ]]; then
+    verdict="Critical"
+    message="SMART reports a clear failure. Back up immediately and replace the drive."
+    escalate $EXIT_CRIT
+  elif [[ $health_state == "WARNING" ]]; then
+    verdict="Suspicious"
+    message="The drive reports a warning through its SMART status, for example about temperature. Action 1 shows the details."
+    escalate $EXIT_WARN
+  elif (( $(num_or "$defects" 0) > 0 )); then
+    verdict="Suspicious"
+    message="There are problem blocks. Not a total loss yet, but a backup and closer monitoring are advisable."
+    escalate $EXIT_WARN
+  elif [[ $st_status == "failed" ]]; then
+    verdict="Suspicious"
+    message="The most recent self-test did not finish without errors. Make a backup and keep an eye on the drive."
+    escalate $EXIT_WARN
+  elif (( $(num_or "$endurance" 0) >= 90 )); then
+    verdict="Worn"
+    message="The SSD has used up a lot of its rated life. It still works, but the end is approaching."
+    escalate $EXIT_WARN
+  elif [[ $health_state == "UNKNOWN" && -z $temp$defects$endurance$poh ]]; then
+    # $attrs itself is never empty: smartctl always prints its banner.
+    verdict="Unknown"
+    message="No SMART values could be read. The condition cannot be judged."
+    escalate $EXIT_WARN
+  else
+    verdict="Healthy"
+    message="The drive currently looks healthy and unremarkable."
+  fi
+
+  echo
+  printf 'Condition: %s\n' "$verdict"
+  echo "$message"
+  echo
+  echo "Key values:"
+  echo "- SMART health: ${health_state}"
+  [[ $st_status != "unknown" ]] && echo "- Latest self-test: $(selftest_status_text "$st_status")"
+  [[ -n $temp      ]] && echo "- Temperature: ${temp}"
+  [[ -n $poh       ]] && echo "- Power-on hours: ${poh}"
+  [[ -n $endurance ]] && echo "- Wear (percentage used endurance): ${endurance}"
+  [[ -n $defects   ]] && echo "- Grown defects: ${defects}"
   return 0
 }
 
@@ -1198,11 +1263,11 @@ friendly_summary() {
   selftest_log="$(smartctl_dev -l selftest 2>/dev/null || true)"
   st_status="$(selftest_line_status "$(last_selftest_line "$selftest_log")")"
 
-  if [[ $family == "nvme" ]]; then
-    summary_nvme "$health_state" "$attrs" "$st_status"
-  else
-    summary_ata "$health_state" "$attrs" "$st_status"
-  fi
+  case "$family" in
+    nvme) summary_nvme "$health_state" "$attrs" "$st_status" ;;
+    scsi) summary_scsi "$health_state" "$attrs" "$st_status" ;;
+    *)    summary_ata  "$health_state" "$attrs" "$st_status" ;;
+  esac
 
   echo
   echo "Latest self-test log:"

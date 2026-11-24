@@ -29,6 +29,7 @@ Die Logik ist in beiden Dateien Zeile für Zeile dieselbe, nur die Texte und Kom
 - **Automatische Ermittlung der smartctl-Parameter** — probiert der Reihe nach `-d sat`, `-d sat,12`, `-d nvme`, `-d scsi`, `-d ata`, bis das Gerät antwortet
 - **Auswertung nach dem, was tatsächlich antwortet** — ob ATA, NVMe oder SCSI, entscheidet die Antwort von `smartctl -i`, nicht der Gerätename. NVMe-SSDs in USB-Gehäusen und Pfade wie `/dev/disk/by-id/…` werden dadurch richtig ausgewertet
 - **NVMe-korrekt**: Tests und Logs laufen gegen den Controller-Knoten (`/dev/nvme0`), nicht gegen den Namespace (`/dev/nvme0n1`)
+- **SAS-tauglich**: Grown Defect List, Verschleiß von SAS-SSDs, Selbsttest-Fortschritt und Abbruch werden ausgewertet bzw. unterstützt
 - **Fortschrittsbalken mit Restzeitschätzung** — gemessen zwischen den Fortschrittsstufen der Firmware, bis zur ersten Stufe aus der Herstellerangabe (`recommended polling time`)
 - **Hängt sich an bereits laufende Tests an**, statt sie zu stören oder zu scheitern
 - **Klartext-Bewertung** statt Rohwerten, mit passendem Exitcode für die Weiterverarbeitung
@@ -115,7 +116,7 @@ Selbsttests sind **lesend und ungefährlich**. Der Datenträger bleibt währendd
 
 ### Wie die Bewertung zustande kommt
 
-**SATA / SAS (ATA-Attribute)**
+**SATA (ATA-Attribute)**
 
 | Zustand | Auslöser | Code |
 |---|---|---|
@@ -139,6 +140,18 @@ Selbsttests sind **lesend und ungefährlich**. Der Datenträger bleibt währendd
 | Unbekannt | keine Werte lesbar | 1 |
 | Unauffällig | keiner der obigen Fälle | 0 |
 
+**SAS / SCSI**
+
+| Zustand | Auslöser | Code |
+|---|---|---|
+| Kritisch | `SMART Health Status` meldet eine drohende Störung (`… FAILURE …`, `BAD`) | 2 |
+| Auffällig | `SMART Health Status` meldet eine Warnung (`WARNING - …`, z. B. Temperaturschwelle überschritten) | 1 |
+| Auffällig | `Elements in grown defect list` größer als 0 — das Gegenstück zu den Reallocated Sectors | 1 |
+| Auffällig | Der jüngste Selbsttest ist mit einem Fehler beendet worden | 1 |
+| Abgenutzt | `Percentage used endurance indicator` ab 90 % (nur SAS-SSDs) | 1 |
+| Unbekannt | keine Werte lesbar | 1 |
+| Unauffällig | keiner der obigen Fälle | 0 |
+
 Der jüngste Eintrag im Selbsttest-Log fließt in die Bewertung ein: Endet er mit einem Fehler (z. B. „Completed: read failure"), lautet der Zustand mindestens „Auffällig" und der Exitcode mindestens 1. Ein abgebrochener oder unterbrochener Test zählt nicht als Fehler. In der Werteliste steht das Ergebnis als „Letzter Selbsttest".
 
 Wichtig: die Restlebensdauer steht im **normalisierten** Wert (Spalte `VALUE`), nicht im Rohwert. `Wear_Leveling_Count` mit Rohwert 201 und VALUE 94 heißt: 94 % Restlebensdauer, nicht 201 von irgendwas. Das ist eine der häufigsten Fehlinterpretationen von SMART-Daten.
@@ -148,8 +161,10 @@ Wichtig: die Restlebensdauer steht im **normalisierten** Wert (Spalte `VALUE`), 
 Tägliche Zustandsprüfung per Cron, mit Meldung nur im Problemfall:
 
 ```cron
-30 6 * * * root /usr/local/bin/smart-monitor -d /dev/sda -a 4 > /tmp/smart-sda.log 2>&1 || mail -s "SMART-Warnung sda" root < /tmp/smart-sda.log
+30 6 * * * root /usr/local/bin/smart-monitor -d /dev/sda -a 4 > /var/log/smart-sda.log 2>&1 || mail -s "SMART-Warnung sda" root < /var/log/smart-sda.log
 ```
+
+Die Logdatei liegt bewusst nicht unter `/tmp`: Einen festen Dateinamen dort kann jeder Nutzer vorab als Symlink anlegen, und der Cronjob würde dann als root die verlinkte Datei überschreiben.
 
 Wöchentlicher erweiterter Test als systemd-Timer:
 
@@ -189,7 +204,7 @@ Für dauerhafte Überwachung im Hintergrund ist der Daemon `smartd` aus demselbe
 
 - **USB-Gehäuse** reichen SMART-Kommandos oft nur teilweise durch. Das Skript warnt, versucht es aber trotzdem. Wenn nichts geht, hilft manchmal ein manuelles `smartctl -d sat -a /dev/sdX` oder `-d usbjmicron`.
 - **Hardware-RAID-Controller** verstecken die einzelnen Platten. Dafür braucht es gerätespezifische Parameter wie `-d megaraid,N` oder `-d cciss,N`, die das Skript nicht automatisch durchprobiert.
-- **SAS/SCSI-Platten** liefern keine ATA-Attributtabelle. Health-Status, Selbsttests samt Fortschritt und der Abbruch funktionieren, die Detailwerte bleiben leer.
+- **SAS/SCSI-Platten** liefern keine ATA-Attributtabelle. Ausgewertet werden Health-Status, Grown Defect List, Temperatur, Betriebsstunden und bei SSDs der Verschleiß. Die Fehlerzähler (`smartctl -l error`) fließen nicht in die Bewertung ein.
 - **Virtuelle Datenträger** (virtio, mmc) haben in der Regel gar keine SMART-Daten.
 - Die Restzeitschätzung ist eine Schätzung. ATA-Laufwerke melden den Fortschritt nur in 10-%-Stufen; eine gemessene Restzeit gibt es deshalb erst nach der ersten Stufe, vorher gilt die Herstellerangabe. Die ist oft großzügig gerundet.
 
@@ -201,7 +216,7 @@ Für dauerhafte Überwachung im Hintergrund ist der Daemon `smartd` aus demselbe
 | `smartctl wurde nicht gefunden` | `smartmontools` installieren; auf manchen Systemen liegt es in `/usr/sbin` und ist für normale Nutzer nicht im PATH |
 | `smartctl kann … nicht ansprechen` | Kein Zugriff über die üblichen Transportarten. Manuell testen: `sudo smartctl -i -d sat /dev/sdX` |
 | `Es wurde kein laufender Selbsttest erkannt` | Das Laufwerk hat den Test entweder sofort beendet oder unterstützt keine Selbsttests (typisch bei USB und virtuellen Platten) |
-| Keine Attributwerte in der Zusammenfassung | Wahrscheinlich eine SAS- oder USB-Platte ohne ATA-Attributtabelle. Aktion 1 zeigt, was tatsächlich geliefert wird |
+| Keine Attributwerte in der Zusammenfassung | Wahrscheinlich ein USB-Gehäuse, das SMART nicht durchreicht. Aktion 1 zeigt, was tatsächlich geliefert wird |
 
 ### Entwicklung
 
@@ -218,6 +233,21 @@ norm() { sed -e '/^usage() {/,/^}/d' \
              -e 's/[[:space:]]\+/ /g' "$1" | grep -v '^ *$'; }
 diff <(norm smart-monitor.de.sh) <(norm smart-monitor.en.sh)
 ```
+
+### Versionen
+
+**1.2.0**
+
+- Bewertung: „Unbekannt" greift jetzt wirklich, wenn nichts lesbar ist (vorher: „Unauffällig" mit Exitcode 0)
+- Bewertung: `FAILING_NOW` wird auch erkannt, wenn `smartctl -H` PASSED meldet
+- Bewertung: ein fehlgeschlagener jüngster Selbsttest ist Teil des Zustands, nicht nur ein Hinweis darunter
+- Bewertung: SAS/SCSI mit Health-Warnungen, Grown Defect List, Verschleiß, Temperatur und Betriebsstunden
+- Erkennung: ATA, NVMe oder SCSI nach der Antwort von `smartctl -i`; `/dev/disk/by-id/…` wird aufgelöst
+- Erkennung: `-d sat,12` wird vor `-d scsi` probiert; zram und leere Kartenleser fehlen in der Auswahlliste
+- Selbsttest: Restzeit gemessen zwischen den Fortschrittsstufen, statt anfangs um ein Vielfaches zu niedrig
+- Selbsttest: Fortschritt und Abbruch bei SAS; Art eines bereits laufenden Tests wird übernommen
+- Selbsttest: eine einzelne fehlgeschlagene Abfrage beendet die Anzeige nicht mehr; abgebrochene oder fehlerhafte Tests enden nicht mit 100 %
+- CI-Workflow liegt jetzt unter `.github/workflows/` und läuft damit tatsächlich
 
 ### Lizenz
 
@@ -246,6 +276,7 @@ The logic is line-for-line the same in both files; only the messages and comment
 - **Automatic smartctl parameter detection** — tries `-d sat`, `-d sat,12`, `-d nvme`, `-d scsi`, `-d ata` in turn until the device answers
 - **Evaluated by what actually answers** — whether ATA, NVMe or SCSI is decided by the `smartctl -i` response, not the device name. NVMe SSDs in USB enclosures and paths such as `/dev/disk/by-id/…` are therefore evaluated correctly
 - **NVMe done right**: tests and logs target the controller node (`/dev/nvme0`), not the namespace (`/dev/nvme0n1`)
+- **SAS-aware**: grown defect list, SAS SSD wear, self-test progress and aborting are evaluated or supported
 - **Progress bar with a remaining-time estimate**, measured between the firmware's progress steps and taken from the vendor's `recommended polling time` until the first step
 - **Attaches to an already running test** instead of disturbing it or failing
 - **Plain-language verdict** instead of raw values, with a matching exit code for further processing
@@ -332,7 +363,7 @@ Self-tests are **read-only and harmless**. The drive stays usable while one runs
 
 ### How the verdict is reached
 
-**SATA / SAS (ATA attributes)**
+**SATA (ATA attributes)**
 
 | Verdict | Trigger | Code |
 |---|---|---|
@@ -356,6 +387,18 @@ Self-tests are **read-only and harmless**. The drive stays usable while one runs
 | Unknown | No values readable | 1 |
 | Healthy | None of the above | 0 |
 
+**SAS / SCSI**
+
+| Verdict | Trigger | Code |
+|---|---|---|
+| Critical | `SMART Health Status` reports an impending failure (`… FAILURE …`, `BAD`) | 2 |
+| Suspicious | `SMART Health Status` reports a warning (`WARNING - …`, e.g. temperature threshold exceeded) | 1 |
+| Suspicious | `Elements in grown defect list` greater than 0 — the counterpart of reallocated sectors | 1 |
+| Suspicious | The most recent self-test ended with an error | 1 |
+| Worn | `Percentage used endurance indicator` at 90 % or higher (SAS SSDs only) | 1 |
+| Unknown | No values readable | 1 |
+| Healthy | None of the above | 0 |
+
 The most recent self-test log entry is part of the verdict: if it ended with an error (e.g. "Completed: read failure"), the condition is at least "Suspicious" and the exit code at least 1. An aborted or interrupted test does not count as an error. The key values list shows the result as "Latest self-test".
 
 One thing worth knowing: remaining life lives in the **normalised** value (the `VALUE` column), not in the raw value. `Wear_Leveling_Count` with raw value 201 and VALUE 94 means 94 % life left, not 201 of anything. This is one of the most common misreadings of SMART data.
@@ -365,8 +408,10 @@ One thing worth knowing: remaining life lives in the **normalised** value (the `
 Daily health check via cron, reporting only when something is wrong:
 
 ```cron
-30 6 * * * root /usr/local/bin/smart-monitor -d /dev/sda -a 4 > /tmp/smart-sda.log 2>&1 || mail -s "SMART warning sda" root < /tmp/smart-sda.log
+30 6 * * * root /usr/local/bin/smart-monitor -d /dev/sda -a 4 > /var/log/smart-sda.log 2>&1 || mail -s "SMART warning sda" root < /var/log/smart-sda.log
 ```
+
+The log file deliberately does not live in `/tmp`: any user can create a fixed file name there in advance as a symlink, and the cron job would then overwrite the link target as root.
 
 Weekly extended test as a systemd timer:
 
@@ -406,7 +451,7 @@ For continuous background monitoring, the `smartd` daemon from the same package 
 
 - **USB enclosures** frequently pass SMART commands through only partially. The script warns but still tries. When nothing works, a manual `smartctl -d sat -a /dev/sdX` or `-d usbjmicron` sometimes helps.
 - **Hardware RAID controllers** hide the individual disks. They need device-specific parameters such as `-d megaraid,N` or `-d cciss,N`, which the script does not try automatically.
-- **SAS/SCSI drives** do not expose an ATA attribute table. Health status, self-tests including progress, and aborting work; the detailed values stay empty.
+- **SAS/SCSI drives** do not expose an ATA attribute table. What gets evaluated is the health status, the grown defect list, temperature, power-on hours and, on SSDs, wear. The error counters (`smartctl -l error`) are not part of the verdict.
 - **Virtual drives** (virtio, mmc) usually have no SMART data at all.
 - The remaining-time figure is an estimate. ATA drives report progress in 10 % steps only, so a measured figure is available after the first step; until then the vendor figure applies, and that is often generously rounded.
 
@@ -418,7 +463,7 @@ For continuous background monitoring, the `smartd` daemon from the same package 
 | `smartctl was not found` | Install `smartmontools`; on some systems it lives in `/usr/sbin` and is not in a normal user's PATH |
 | `smartctl cannot talk to …` | No access via the usual transports. Test by hand: `sudo smartctl -i -d sat /dev/sdX` |
 | `No running self-test was detected` | The drive either finished the test instantly or does not support self-tests (common with USB and virtual disks) |
-| No attribute values in the summary | Most likely a SAS or USB drive without an ATA attribute table. Action 1 shows what is actually returned |
+| No attribute values in the summary | Most likely a USB enclosure that does not pass SMART through. Action 1 shows what is actually returned |
 
 ### Development
 
@@ -435,6 +480,21 @@ norm() { sed -e '/^usage() {/,/^}/d' \
              -e 's/[[:space:]]\+/ /g' "$1" | grep -v '^ *$'; }
 diff <(norm smart-monitor.de.sh) <(norm smart-monitor.en.sh)
 ```
+
+### Versions
+
+**1.2.0**
+
+- Verdict: "Unknown" now really applies when nothing is readable (previously: "Healthy" with exit code 0)
+- Verdict: `FAILING_NOW` is detected even when `smartctl -H` reports PASSED
+- Verdict: a failed most recent self-test is part of the condition, not just a note below it
+- Verdict: SAS/SCSI with health warnings, grown defect list, wear, temperature and power-on hours
+- Detection: ATA, NVMe or SCSI is decided by the `smartctl -i` response; `/dev/disk/by-id/…` is resolved
+- Detection: `-d sat,12` is tried before `-d scsi`; zram and empty card readers are left out of the selection list
+- Self-test: remaining time measured between progress steps instead of being far too low at the start
+- Self-test: progress and aborting on SAS; the kind of an already running test is picked up
+- Self-test: a single failed query no longer ends the display; aborted or failed tests no longer end at 100 %
+- The CI workflow now lives in `.github/workflows/` and therefore actually runs
 
 ### License
 
